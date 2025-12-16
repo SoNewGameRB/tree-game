@@ -5,6 +5,7 @@ import {
   orderBy,
   limit,
   onSnapshot,
+  getDocs,
   serverTimestamp
 } from 'firebase/firestore'
 import { db } from '../firebase/config'
@@ -61,13 +62,23 @@ export const getRecentMessages = async (limitCount = 50) => {
   }
 }
 
-// 監聽聊天記錄（實時更新）
+// 監聽聊天記錄（實時更新，優化：使用節流減少讀取頻率）
+let lastChatTime = 0
+const CHAT_THROTTLE = 2000 // 2秒內最多觸發一次
+
 export const subscribeChatMessages = (callback, limitCount = 50) => {
   try {
     const chatRef = collection(db, CHAT_COLLECTION)
     const q = query(chatRef, orderBy('timestamp', 'desc'), limit(limitCount))
     
     return onSnapshot(q, (snapshot) => {
+      const now = Date.now()
+      // 節流：2秒內最多觸發一次
+      if (now - lastChatTime < CHAT_THROTTLE) {
+        return
+      }
+      lastChatTime = now
+      
       const messages = snapshot.docs
         .map(doc => ({
           id: doc.id,

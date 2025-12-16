@@ -20,6 +20,24 @@ import {
   getLocalMessages
 } from '../utils/chatService'
 import { getAllWeapons } from '../utils/weaponService'
+import { saveGameData, loadGameData } from '../utils/userService'
+import {
+  getPlayerGameData,
+  updatePlayerGold,
+  batchUpdatePlayerGold,
+  drawCardWithValidation,
+  addWeaponToInventory,
+  sellWeapon,
+  sacrificeUpgradeWithValidation,
+  updateTotalDamage,
+  updateTotalGoldEarned,
+  updateAchievement as updateAchievementInFirestore,
+  saveOfflineState,
+  clearOfflineState,
+  calculateOfflineRewards,
+  applyOfflineRewards,
+  clearAllPlayersData
+} from '../utils/gameDataService'
 
 const props = defineProps({
   user: {
@@ -36,6 +54,17 @@ const treeHealth = ref(1000000) // 樹的血量（從 Firebase 同步）
 const maxTreeHealth = ref(1000000) // 最大血量
 const totalDamage = ref(0) // 總傷害（個人）
 const attackTimer = ref(null) // 當前斧頭的攻擊計時器
+const lastAttackTime = ref(Date.now()) // 上次攻擊時間（用於基於時間戳的攻擊計算）
+const lastActivityTime = ref(Date.now()) // 最後一次用戶活動時間（用於離線收益計算）
+const activityCheckInterval = ref(null) // 活動檢查計時器（檢查是否需要保存離線狀態）
+const attackCheckInterval = ref(null) // 攻擊檢查定時器（基於時間戳檢查是否需要攻擊）
+
+// 自動保存計時器
+const saveTimer = ref(null)
+const isSaving = ref(false)
+
+// 清除資料狀態
+const isClearingData = ref(false)
 
 // 多人遊戲狀態
 const recentAttacks = ref([]) // 最近的攻擊記錄
@@ -44,6 +73,7 @@ const gameStateUnsubscribe = ref(null) // 遊戲狀態監聽器
 const attacksUnsubscribe = ref(null) // 攻擊記錄監聽器
 const usersUnsubscribe = ref(null) // 在線玩家監聽器
 const isMultiplayerReady = ref(false) // 多人遊戲是否已初始化
+const multiplayerError = ref(null) // 多人模式連接錯誤
 
 // 當前使用的斧頭
 const currentAxe = computed(() => {
@@ -111,6 +141,21 @@ const fallbackWeaponDatabase = [
   { id: 22, name: '認真斧', icon: '🎯', rarity: 'LEGENDARY', attack: 98, attackInterval: 590, goldChance: 0.91, goldMin: 73, goldMax: 125, description: '不騙你，真的強，認真的' }
 ]
 
+// Z世代創意斧頭資料庫（從 Firestore 加載）
+const cardDatabase = ref([])
+
+// 按稀有度分組卡片
+const cardsByRarity = computed(() => {
+  const weapons = cardDatabase.value.length > 0 ? cardDatabase.value : fallbackWeaponDatabase
+  const grouped = {}
+  weapons.forEach(card => {
+    if (!grouped[card.rarity]) {
+      grouped[card.rarity] = []
+    }
+    grouped[card.rarity].push(card)
+  })
+  return grouped
+})
 
 // 加權隨機抽取（基於攻擊傷害的權重）
 const drawRandomCard = (targetRarity = null) => {
@@ -119,7 +164,7 @@ const drawRandomCard = (targetRarity = null) => {
   let availableCards = weapons
   if (targetRarity) {
     // 只抽取指定稀有度的武器
-    availableCards = cardDatabase.filter(card => card.rarity === targetRarity)
+    availableCards = weapons.filter(card => card.rarity === targetRarity)
   }
   
   // 如果沒有可用卡片，返回 null
@@ -128,31 +173,56 @@ const drawRandomCard = (targetRarity = null) => {
     return null
   }
   
-  // 計算權重時，需要考慮低級稀有度的最高傷害
+  // 計算權重：每個稀有度內的武器都基於該稀有度內的最高傷害來計算
+  // 這樣可以確保每個稀有度內的武器機率都不同
   const rarityOrder = ['COMMON', 'RARE', 'EPIC', 'LEGENDARY']
-  let maxAttack = Math.max(...availableCards.map(card => card.attack))
+  
+  // 如果指定了目標稀有度，只計算該稀有度內的權重
+  // 如果沒有指定，則需要分別計算每個稀有度的權重
+  let availableWeights = []
   
   if (targetRarity) {
-    // 如果指定了目標稀有度，需要包含所有低級稀有度的最高傷害
-    const targetRarityIndex = rarityOrder.indexOf(targetRarity)
-    if (targetRarityIndex > 0) {
-      // 計算所有低級稀有度的最高傷害
-      for (let i = 0; i < targetRarityIndex; i++) {
-        const lowerRarityCards = weapons.filter(card => card.rarity === rarityOrder[i])
-        if (lowerRarityCards.length > 0) {
-          const lowerMaxAttack = Math.max(...lowerRarityCards.map(card => card.attack))
-          // 將低級稀有度的最高傷害包含在權重計算中
-          maxAttack = Math.max(maxAttack, lowerMaxAttack)
-        }
+    // 指定稀有度：只計算該稀有度內的權重
+    const maxAttack = Math.max(...availableCards.map(card => card.attack))
+    availableWeights = availableCards.map(card => {
+      const attackDiff = maxAttack - card.attack + 1
+      const weight = Math.pow(attackDiff, 2) // 平方權重
+      return {
+        card: card,
+        weight: weight
       }
-    }
+    })
+  } else {
+    // 普通抽卡：分別計算每個稀有度的權重，然後按稀有度機率加權
+    const rarityWeights = {}
+    
+    // 先計算每個稀有度的總權重
+    rarityOrder.forEach(rarity => {
+      const rarityCards = availableCards.filter(card => card.rarity === rarity)
+      if (rarityCards.length > 0) {
+        const maxAttack = Math.max(...rarityCards.map(card => card.attack))
+        const weights = rarityCards.map(card => {
+          const attackDiff = maxAttack - card.attack + 1
+          return {
+            card: card,
+            weight: Math.pow(attackDiff, 2) // 平方權重
+          }
+        })
+        rarityWeights[rarity] = weights
+      }
+    })
+    
+    // 將每個稀有度的權重按稀有度機率加權
+    Object.keys(rarityWeights).forEach(rarity => {
+      const rarityProb = RARITY[rarity].weight / 100 // 稀有度機率（0-1）
+      rarityWeights[rarity].forEach(item => {
+        availableWeights.push({
+          card: item.card,
+          weight: item.weight * rarityProb // 按稀有度機率加權
+        })
+      })
+    })
   }
-  
-  // 計算可用卡片的權重（攻擊力越低，權重越高）
-  const availableWeights = availableCards.map(card => ({
-    card: card,
-    weight: maxAttack + 1 - card.attack
-  }))
   const availableTotalWeight = availableWeights.reduce((sum, item) => sum + item.weight, 0)
   
   // 按照權重隨機選擇
@@ -201,18 +271,56 @@ const stopCurrentAttackTimer = () => {
     clearInterval(attackTimer.value)
     attackTimer.value = null
   }
+  if (attackCheckInterval.value) {
+    clearInterval(attackCheckInterval.value)
+    attackCheckInterval.value = null
+  }
 }
 
-// 啟動當前斧頭的攻擊計時器
+// 啟動當前斧頭的攻擊計時器（使用基於時間戳的方式，適用於手機瀏覽器）
 const startCurrentAttackTimer = () => {
   if (!currentAxe.value) return
   
   stopCurrentAttackTimer()
   
   const card = currentAxe.value
-  attackTimer.value = setInterval(() => {
-    attackTreeWithCurrentAxe()
-  }, card.attackInterval)
+  lastAttackTime.value = Date.now() // 記錄啟動時間
+  
+  // 使用基於時間戳的檢查方式，每100ms檢查一次（適合手機瀏覽器）
+  attackCheckInterval.value = setInterval(() => {
+    if (!currentAxe.value) {
+      stopCurrentAttackTimer()
+      return
+    }
+    
+    const now = Date.now()
+    const timeSinceLastAttack = now - lastAttackTime.value
+    const requiredInterval = currentAxe.value.attackInterval
+    
+    // 如果已經過了攻擊間隔時間，執行攻擊
+    // 考慮可能跳過的時間（例如手機卡頓），允許補償錯過的攻擊
+    if (timeSinceLastAttack >= requiredInterval) {
+      const attacksToExecute = Math.floor(timeSinceLastAttack / requiredInterval)
+      // 限制補償次數，防止一次執行太多攻擊導致卡頓
+      // 如果超過10次，只補償10次，剩餘時間重新開始計算
+      const actualAttacks = Math.min(attacksToExecute, 10)
+      
+      // 執行補償攻擊（直接調用，因為每次攻擊都是獨立的）
+      for (let i = 0; i < actualAttacks; i++) {
+        attackTreeWithCurrentAxe(true) // 標記為自動攻擊，不更新活動時間
+      }
+      
+      // 更新攻擊時間
+      if (actualAttacks >= attacksToExecute) {
+        // 如果補償了所有攻擊，保留剩餘時間
+        const remainingTime = timeSinceLastAttack % requiredInterval
+        lastAttackTime.value = now - remainingTime
+      } else {
+        // 如果還有更多攻擊需要補償，從當前時間重新開始（下次檢查時會繼續補償）
+        lastAttackTime.value = now
+      }
+    }
+  }, 100) // 每100ms檢查一次，減少檢查頻率但仍然精確
 }
 
 // 升級斧頭
@@ -236,6 +344,9 @@ const upgradeAxe = (axe, baseCard) => {
 // 更換當前使用的斧頭
 const switchAxe = async (index) => {
   if (index < 0 || index >= inventory.value.length) return
+  
+  // 更新活動時間
+  updateActivityTime()
   
   // 停止當前斧頭的攻擊計時器
   stopCurrentAttackTimer()
@@ -280,11 +391,14 @@ const getSellPrice = (axe) => {
 }
 
 // 賣出斧頭
-const sellAxe = (index, event) => {
+const sellAxe = async (index, event) => {
   // 阻止事件冒泡，避免觸發卡片點擊
   if (event) {
     event.stopPropagation()
   }
+  
+  // 更新活動時間
+  updateActivityTime()
   
   if (index < 0 || index >= inventory.value.length) return
   
@@ -296,83 +410,154 @@ const sellAxe = (index, event) => {
   
   const axe = inventory.value[index]
   const sellPrice = getSellPrice(axe)
-  const isCurrentAxe = currentAxeIndex.value === index
-  let newAxeIndex = null
   
-  // 如果賣出的是當前使用的斧頭，需要先切換到其他斧頭
-  if (isCurrentAxe) {
-    stopCurrentAttackTimer()
-    // 選擇其他斧頭
-    if (inventory.value.length > 1) {
-      // 選擇索引0，如果0就是當前這個，則選擇1
-      newAxeIndex = index === 0 ? 1 : 0
+  // 如果是管理員或用戶沒有 UID，直接操作（本地模式）
+  if (props.user.isAdmin || !props.user.uid) {
+    const isCurrentAxe = currentAxeIndex.value === index
+    let newAxeIndex = null
+    
+    if (isCurrentAxe) {
+      stopCurrentAttackTimer()
+      if (inventory.value.length > 1) {
+        newAxeIndex = index === 0 ? 1 : 0
+      }
     }
+    
+    inventory.value.splice(index, 1)
+    
+    if (isCurrentAxe) {
+      if (newAxeIndex !== null) {
+        currentAxeIndex.value = newAxeIndex > index ? newAxeIndex - 1 : newAxeIndex
+        startCurrentAttackTimer()
+      } else {
+        currentAxeIndex.value = null
+      }
+    } else if (currentAxeIndex.value !== null && currentAxeIndex.value > index) {
+      currentAxeIndex.value--
+    }
+    
+    gold.value += sellPrice
+    showNotification(`賣出 ${axe.name} 獲得 ${sellPrice} 金錢！`, 'success')
+    return
   }
   
-  // 從背包中移除（splice會讓所有索引 > index 的元素索引減1）
-  inventory.value.splice(index, 1)
-  
-  // 更新當前使用的斧頭索引
-  if (isCurrentAxe) {
-    // 賣出的是當前使用的斧頭
-    if (newAxeIndex !== null) {
-      // 如果新選擇的索引在賣出索引之後，splice後索引會減1
-      currentAxeIndex.value = newAxeIndex > index ? newAxeIndex - 1 : newAxeIndex
+  // Firebase 用戶：通過服務器端驗證
+  try {
+    const result = await sellWeapon(props.user.uid, index, sellPrice)
+    gold.value = result.gold
+    inventory.value = result.inventory
+    currentAxeIndex.value = result.currentAxeIndex
+    
+    // 如果賣出的是當前使用的武器，需要重新啟動計時器
+    if (result.currentAxeIndex !== null && inventory.value[result.currentAxeIndex]) {
+      stopCurrentAttackTimer()
       startCurrentAttackTimer()
-    } else {
-      currentAxeIndex.value = null
+    } else if (result.currentAxeIndex === null) {
+      stopCurrentAttackTimer()
     }
-  } else if (currentAxeIndex.value !== null && currentAxeIndex.value > index) {
-    // 賣出的不是當前使用的斧頭，且當前索引在賣出索引之後，索引減1
-    currentAxeIndex.value--
+    
+    showNotification(`賣出 ${axe.name} 獲得 ${sellPrice} 金錢！`, 'success')
+  } catch (error) {
+    console.error('賣出武器失敗:', error)
+    showNotification(error.message || '賣出武器失敗', 'error')
   }
-  
-  // 獲得金錢
-  gold.value += sellPrice
-  
-  showNotification(`賣出 ${axe.name} 獲得 ${sellPrice} 金錢！`, 'success')
 }
 
-// 使用當前斧頭攻擊樹（多人版本）
-const attackTreeWithCurrentAxe = async () => {
+// 更新用戶活動時間（用於離線收益計算）
+const updateActivityTime = () => {
+  lastActivityTime.value = Date.now()
+  // 如果離線狀態存在，清除它（因為用戶又開始活動了）
+  if (!props.user.isAdmin && props.user.uid && isMultiplayerReady.value) {
+    clearOfflineState(props.user.uid).catch(err => console.error('清除離線狀態失敗:', err))
+  }
+}
+
+// 註：已移除批量同步邏輯，現在所有數據都直接從後端返回
+
+// 檢查並應用離線收益（定期調用，用於掛機時自動計算收益）
+const checkAndApplyOfflineRewards = async () => {
+  if (props.user.isAdmin || !props.user.uid) {
+    return
+  }
+  
+  try {
+    console.log('定期檢查離線收益...')
+    const rewards = await calculateOfflineRewards(props.user.uid)
+    
+    if (rewards && rewards.attackCount > 0) {
+      console.log('發現離線收益，應用中...', rewards)
+      const result = await applyOfflineRewards(props.user.uid, rewards)
+      
+      // 更新本地狀態
+      gold.value = result.newGold
+      totalDamage.value = result.newTotalDamage
+      totalGoldEarned.value = result.newTotalGoldEarned
+      
+      // 顯示離線收益通知
+      showNotification(
+        `💰 掛機收益：${rewards.offlineHours}小時內攻擊 ${rewards.attackCount} 次，造成 ${rewards.totalDamage} 傷害，獲得 ${rewards.totalGoldEarned} 金錢！`,
+        'success'
+      )
+      console.log('✓ 離線收益已應用並顯示')
+      
+      // 更新檢查時間
+      lastOfflineRewardCheck.value = Date.now()
+    } else {
+      console.log('沒有離線收益（離線時間太短或沒有離線狀態）')
+    }
+  } catch (error) {
+    console.error('檢查離線收益失敗:', error)
+  }
+}
+
+// 使用當前斧頭攻擊樹（後端權威模式：所有數據來自後端）
+// isAutoAttack: 是否為自動攻擊（自動攻擊不更新活動時間，避免影響離線收益計算）
+const attackTreeWithCurrentAxe = async (isAutoAttack = false) => {
   if (!currentAxe.value || treeHealth.value <= 0) return
+  
+  // 只有非自動攻擊才更新活動時間（自動攻擊不應該影響離線收益計算）
+  if (!isAutoAttack) {
+    updateActivityTime()
+  }
   
   const card = currentAxe.value
   const weaponId = card.baseId || card.id
   const weaponLevel = card.level || 1
   
-  // 如果是測試模式或未連接 Firebase，使用本地模式
-  if (props.user.isTest || !isMultiplayerReady.value) {
+  // 必須連接多人模式才能攻擊（管理員除外）
+  if (props.user.isAdmin) {
     attackTreeLocal()
     return
   }
   
+  // 檢查多人模式是否已連接
+  if (!isMultiplayerReady.value) {
+    showNotification('無法攻擊：多人模式未連接。請等待連接成功或重新載入頁面。', 'error')
+    return
+  }
+  
   try {
-    // 發送到 Firebase（使用武器 ID 和等級，服務器端會驗證並計算傷害）
-    const newHealth = await attackTree(
+    // 發送到 Firebase（使用武器 ID 和等級，服務器端會驗證並計算傷害和金錢）
+    const result = await attackTree(
       props.user.uid,
       props.user.displayName || props.user.email || '未知玩家',
       weaponId,
       weaponLevel
     )
     
-    // 從服務器返回的傷害值（實際造成的傷害）
-    // 注意：這裡我們需要從武器數據計算傷害，因為服務器端已經驗證過了
-    const baseWeapon = cardDatabase.value.find(w => w.id === weaponId) || 
-                       fallbackWeaponDatabase.find(w => w.id === weaponId)
-    const damage = baseWeapon ? Math.floor(baseWeapon.attack * (1 + (weaponLevel - 1) * 0.5)) : card.attack
-    totalDamage.value += damage
-    
-    // 機率性獲得金錢（不得小於0）
-    if (Math.random() <= card.goldChance) {
-      const goldGained = Math.max(0, Math.floor(
-        Math.random() * (card.goldMax - card.goldMin + 1) + card.goldMin
-      ))
-      gold.value += goldGained
-      totalGoldEarned.value += goldGained
-      card.lastGoldGained = goldGained
-    } else {
-      card.lastGoldGained = 0
+    // 後端返回的數據（權威數據源）
+    if (result && result.userData) {
+      // 使用後端返回的數據更新前端狀態
+      gold.value = result.userData.gold
+      totalGoldEarned.value = result.userData.totalGoldEarned
+      totalDamage.value = result.userData.totalDamage
+      
+      // 顯示獲得的金錢（如果有）
+      if (result.userData.goldGained && result.userData.goldGained > 0) {
+        card.lastGoldGained = result.userData.goldGained
+      } else {
+        card.lastGoldGained = 0
+      }
     }
     
     // 更新用戶狀態
@@ -385,14 +570,38 @@ const attackTreeWithCurrentAxe = async () => {
     }
   } catch (error) {
     console.error('攻擊失敗:', error)
-    // 如果 Firebase 失敗，回退到本地模式
-    attackTreeLocal()
+    showNotification('攻擊失敗：' + (error.message || '未知錯誤'), 'error')
   }
 }
 
 // 本地攻擊模式（備用）
-const attackTreeLocal = () => {
+const attackTreeLocal = async () => {
   if (!currentAxe.value || treeHealth.value <= 0) return
+  
+  // 檢查用戶是否超過3天未上線（停止傷害計算）
+  if (props.user.uid && !props.user.isAdmin) {
+    try {
+      const { getUserData } = await import('../utils/userService')
+      const userData = await getUserData(props.user.uid)
+      
+      if (userData && userData.lastLogin) {
+        // 將 Firestore Timestamp 轉換為 Date
+        const lastLoginDate = userData.lastLogin.toDate ? userData.lastLogin.toDate() : new Date(userData.lastLogin)
+        const now = new Date()
+        const daysSinceLogin = (now - lastLoginDate) / (1000 * 60 * 60 * 24) // 轉換為天數
+        
+        // 如果超過3天未上線，停止傷害計算
+        if (daysSinceLogin > 3) {
+          console.log(`用戶已超過3天未上線（${daysSinceLogin.toFixed(1)}天），停止傷害計算`)
+          showNotification(`您已超過3天未上線，請重新登入以繼續遊戲`, 'warning')
+          return
+        }
+      }
+    } catch (error) {
+      console.error('檢查用戶登入時間失敗:', error)
+      // 如果檢查失敗，繼續正常流程（避免影響遊戲體驗）
+    }
+  }
   
   const card = currentAxe.value
   const damage = card.attack
@@ -404,9 +613,17 @@ const attackTreeLocal = () => {
     const goldGained = Math.max(0, Math.floor(
       Math.random() * (card.goldMax - card.goldMin + 1) + card.goldMin
     ))
-    gold.value += goldGained
-    totalGoldEarned.value += goldGained
-    card.lastGoldGained = goldGained
+    
+    // 如果是管理員或用戶沒有 UID，直接操作（本地模式）
+    if (props.user.isAdmin || !props.user.uid) {
+      gold.value += goldGained
+      totalGoldEarned.value += goldGained
+      card.lastGoldGained = goldGained
+      saveGameDataToFirestore(true)
+    } else {
+      // 註：非管理員用戶應該使用後端攻擊API（attackTreeWithCurrentAxe），這裡不應該執行
+      console.warn('非管理員用戶使用了本地攻擊模式，這不應該發生')
+    }
   } else {
     card.lastGoldGained = 0
   }
@@ -425,8 +642,20 @@ const attackTreeLocal = () => {
   }
 }
 
+// 處理武器數據（返回新武器對象，不直接修改）
+const processWeaponData = (baseCard) => {
+  return { 
+    ...baseCard,
+    baseId: baseCard.id,
+    baseCard: baseCard,
+    instanceId: Date.now() + Math.random(),
+    level: 1,
+    lastGoldGained: 0
+  }
+}
+
 // 處理單個武器（添加或升級）
-const processWeapon = (baseCard, isFirstWeapon = false) => {
+const processWeapon = async (baseCard, isFirstWeapon = false) => {
   // 檢查背包中是否已有相同 id 的斧頭
   const existingAxeIndex = inventory.value.findIndex(axe => axe.baseId === baseCard.id)
   
@@ -439,6 +668,15 @@ const processWeapon = (baseCard, isFirstWeapon = false) => {
     }
     upgradeAxe(existingAxe, existingAxe.baseCard || baseCard)
     showNotification(`升級成功！${existingAxe.name} 升至 ${existingAxe.level} 級！攻擊力：${existingAxe.attack} | 金錢機率：${(existingAxe.goldChance * 100).toFixed(0)}%`, 'success')
+    
+    // 如果是 Firebase 用戶（非管理員），更新到服務器
+    if (!props.user.isAdmin && props.user.uid) {
+      try {
+        await upgradeWeaponInInventory(props.user.uid, existingAxeIndex, existingAxe)
+      } catch (error) {
+        console.error('更新武器失敗:', error)
+      }
+    }
     
     // 如果正在使用這把斧頭，需要重啟計時器
     if (currentAxeIndex.value === existingAxeIndex) {
@@ -465,25 +703,21 @@ const processWeapon = (baseCard, isFirstWeapon = false) => {
     
     showNotification(`獲得新斧頭：${newAxe.name}！`, 'success')
     
-    // 如果抽到傳說級武器，發送公告
-    if (baseCard.rarity === 'LEGENDARY') {
+    // 立即保存（獲得新武器時）
+    saveGameDataToFirestore(true)
+    
+    // 如果抽到傳說級武器，發送公告（管理員不發送）
+    if (baseCard.rarity === 'LEGENDARY' && !props.user.isAdmin) {
       const userName = props.user.displayName || props.user.email || '未知玩家'
       const userId = props.user.uid
       
       // 使用 setTimeout 避免在非 async 函數中使用 await
       setTimeout(async () => {
-        if (isMultiplayerReady.value && !props.user.isTest) {
+        if (isMultiplayerReady.value) {
           try {
             await sendLegendaryAnnouncement(userId, userName, baseCard.name)
           } catch (error) {
             console.error('發送傳說武器公告失敗:', error)
-          }
-        } else {
-          // 測試模式或未連接 Firebase，使用本地存儲
-          sendLocalLegendaryAnnouncement(userId, userName, baseCard.name)
-          // 觸發本地消息更新
-          if (isChatReady.value) {
-            chatMessages.value = getLocalMessages()
           }
         }
       }, 0)
@@ -492,7 +726,10 @@ const processWeapon = (baseCard, isFirstWeapon = false) => {
 }
 
 // 抽武器（加入背包或升級現有斧頭）
-const drawCard = (rarity = null) => {
+const drawCard = async (rarity = null) => {
+  // 更新活動時間
+  updateActivityTime()
+  
   // 根據稀有度確定價格
   const cost = rarity ? drawCardPrices[rarity] : drawCardCost
   
@@ -501,37 +738,55 @@ const drawCard = (rarity = null) => {
     return
   }
 
-  gold.value -= cost
-  totalDrawCount.value++
-  
-  // 根據稀有度決定抽取的武器組合
-  const rarityOrder = ['COMMON', 'RARE', 'EPIC', 'LEGENDARY']
-  const cardsToDraw = []
-  
-  if (!rarity || rarity === 'COMMON') {
-    // 普通：只抽普通
-    cardsToDraw.push({ rarity: 'COMMON', isFirst: currentAxeIndex.value === null })
-  } else {
-    // 其他稀有度：抽該稀有度 + 所有低級稀有度
-    const rarityIndex = rarityOrder.indexOf(rarity)
-    if (rarityIndex !== -1) {
-      // 從高到低抽取（傳說 -> 史詩 -> 稀有 -> 普通）
-      for (let i = rarityIndex; i >= 0; i--) {
-        cardsToDraw.push({ 
-          rarity: rarityOrder[i], 
-          isFirst: i === rarityIndex && currentAxeIndex.value === null 
-        })
+  // 如果是管理員或用戶沒有 UID，直接操作（本地模式）
+  if (props.user.isAdmin || !props.user.uid) {
+    gold.value -= cost
+    totalDrawCount.value++
+    
+    // 根據稀有度決定抽取的武器組合
+    const rarityOrder = ['COMMON', 'RARE', 'EPIC', 'LEGENDARY']
+    const cardsToDraw = []
+    
+    if (!rarity || rarity === 'COMMON') {
+      cardsToDraw.push({ rarity: 'COMMON', isFirst: currentAxeIndex.value === null })
+    } else {
+      const rarityIndex = rarityOrder.indexOf(rarity)
+      if (rarityIndex !== -1) {
+        for (let i = rarityIndex; i >= 0; i--) {
+          cardsToDraw.push({ 
+            rarity: rarityOrder[i], 
+            isFirst: i === rarityIndex && currentAxeIndex.value === null 
+          })
+        }
       }
     }
+    
+    cardsToDraw.forEach((cardInfo, index) => {
+      const baseCard = drawRandomCard(cardInfo.rarity)
+      if (baseCard) {
+        processWeapon(baseCard, cardInfo.isFirst && index === 0)
+      }
+    })
+    return
   }
   
-  // 抽取所有武器
-  cardsToDraw.forEach((cardInfo, index) => {
-    const baseCard = drawRandomCard(cardInfo.rarity)
-    if (baseCard) {
-      processWeapon(baseCard, cardInfo.isFirst && index === 0)
+  // Firebase 用戶：通過服務器端驗證（後端計算機率）
+  try {
+    const result = await drawCardWithValidation(props.user.uid, rarity || 'COMMON', cost)
+    gold.value = result.newGold
+    totalDrawCount.value++
+    
+    // 使用後端返回的武器（後端已計算機率並選擇）
+    if (result.selectedWeapon) {
+      const baseCard = result.selectedWeapon
+      await processWeapon(baseCard, currentAxeIndex.value === null)
+    } else {
+      throw new Error('後端未返回武器')
     }
-  })
+  } catch (error) {
+    console.error('抽卡失敗:', error)
+    showNotification(error.message || '抽卡失敗', 'error')
+  }
 }
 
 // 樹的血量百分比
@@ -549,6 +804,104 @@ const chatInput = ref('') // 聊天輸入框
 const chatUnsubscribe = ref(null) // 聊天監聽器
 const isChatReady = ref(false) // 聊天室是否已初始化
 const chatContainer = ref(null) // 聊天容器引用
+
+// 過濾掉管理員和測試玩家的消息（只顯示正式玩家的消息）
+const filteredChatMessages = computed(() => {
+  return chatMessages.value.filter(message => {
+    // 過濾掉測試玩家和管理員的消息（userId 以 'test-' 或 'admin-' 開頭）
+    const userId = message.userId || ''
+    return !userId.startsWith('test-') && !userId.startsWith('admin-')
+  })
+})
+
+// 初始化聊天室（必須連接多人模式）
+const initChat = async () => {
+  try {
+    // 管理員可以跳過
+    if (props.user.isAdmin) {
+      chatMessages.value = getLocalMessages()
+      isChatReady.value = true
+      return
+    }
+    
+    // 非管理員必須連接多人模式才能使用聊天室
+    if (!isMultiplayerReady.value) {
+      const errorMsg = '無法初始化聊天室：多人模式未連接'
+      console.error('❌', errorMsg)
+      isChatReady.value = false
+      showNotification(errorMsg, 'error')
+      return
+    }
+    
+    // Firebase 用戶：訂閱聊天消息（過濾掉測試玩家的消息）
+    if (isMultiplayerReady.value && props.user.uid) {
+      chatUnsubscribe.value = subscribeChatMessages((messages) => {
+        chatMessages.value = messages
+          .map(msg => ({
+            ...msg,
+            timestamp: msg.timestamp?.toDate ? msg.timestamp.toDate() : new Date(msg.timestamp || Date.now())
+          }))
+          .filter(msg => {
+            // 過濾掉測試玩家和管理員的消息（userId 以 'test-' 或 'admin-' 開頭）
+            const userId = msg.userId || ''
+            return !userId.startsWith('test-') && !userId.startsWith('admin-')
+          })
+      }, 50)
+      isChatReady.value = true
+    } else {
+      // 多人模式未連接，無法使用聊天室
+      isChatReady.value = false
+      console.error('❌ 聊天室初始化失敗：多人模式未連接')
+    }
+  } catch (error) {
+    console.error('初始化聊天室失敗:', error)
+    // 失敗時使用本地存儲
+    chatMessages.value = getLocalMessages()
+    isChatReady.value = true
+  }
+}
+
+// 發送聊天消息
+const sendChatMessage = async () => {
+  const message = chatInput.value.trim()
+  if (!message || !isChatReady.value) return
+  
+  // 管理員不能發送消息到聊天室
+  if (props.user.isAdmin) {
+    showNotification('管理員無法發送消息到聊天室', 'error')
+    chatInput.value = ''
+    return
+  }
+  
+  const userName = props.user.displayName || props.user.email || '未知玩家'
+  const userId = props.user.uid
+  
+  try {
+    if (isMultiplayerReady.value && props.user.uid) {
+      // Firebase 用戶：發送到 Firestore
+      const { sendChatMessage: sendFirebaseMessage } = await import('../utils/chatService')
+      await sendFirebaseMessage(userId, userName, message, 'normal')
+      // 發送成功後，消息會通過監聽器自動更新，所以不需要手動添加
+    } else {
+      // 多人模式未連接，無法發送消息
+      showNotification('無法發送消息：多人模式未連接。', 'error')
+    }
+    
+    chatInput.value = ''
+  } catch (error) {
+    console.error('發送聊天消息失敗:', error)
+    showNotification('發送消息失敗: ' + (error.message || '未知錯誤'), 'error')
+  }
+}
+
+// 滾動聊天到底部
+const scrollChatToBottom = () => {
+  if (chatContainer.value) {
+    setTimeout(() => {
+      chatContainer.value.scrollTop = chatContainer.value.scrollHeight
+    }, 100)
+  }
+}
 
 const switchPage = (page) => {
   currentPage.value = page
@@ -595,6 +948,41 @@ const getCurrentCard = (rarity) => {
   return cards[index] || null
 }
 
+// 獲取稀有度的總機率百分比
+const getRarityTotalProbability = (rarity) => {
+  if (!RARITY[rarity]) return 0
+  const totalWeight = Object.values(RARITY).reduce((sum, r) => sum + r.weight, 0)
+  return ((RARITY[rarity].weight / totalWeight) * 100).toFixed(1)
+}
+
+// 獲取單個卡片在該稀有度內的機率百分比（基於傷害的權重計算）
+const getCardProbability = (card) => {
+  if (!card || !card.rarity) return 0
+  const cards = cardsByRarity.value[card.rarity] || []
+  if (cards.length === 0) return 0
+  
+  // 該稀有度的總機率
+  const rarityTotalProb = parseFloat(getRarityTotalProbability(card.rarity))
+  
+  // 計算該稀有度內所有武器的權重（基於傷害）
+  const maxAttack = Math.max(...cards.map(c => c.attack))
+  const cardWeights = cards.map(c => {
+    const attackDiff = maxAttack - c.attack + 1
+    return Math.pow(attackDiff, 2) // 使用平方權重
+  })
+  const totalWeight = cardWeights.reduce((sum, w) => sum + w, 0)
+  
+  // 計算該卡片的權重
+  const cardAttackDiff = maxAttack - card.attack + 1
+  const cardWeight = Math.pow(cardAttackDiff, 2)
+  
+  // 該卡片在該稀有度內的機率 = 稀有度總機率 * (該卡片權重 / 總權重)
+  const cardProbInRarity = (cardWeight / totalWeight) * 100
+  const finalProb = (rarityTotalProb / 100) * cardProbInRarity
+  
+  return finalProb.toFixed(2)
+}
+
 // 監聽cardsByRarity變化，初始化索引
 watch(cardsByRarity, () => {
   initCarouselIndices()
@@ -608,6 +996,8 @@ const selectedSacrificeAxeIndices = ref([]) // 要獻祭的斧頭索引（多選
 // 武器詳情彈窗
 const showWeaponModal = ref(false) // 是否顯示武器詳情彈窗
 const selectedWeaponIndex = ref(null) // 選中的武器索引
+const showBaseWeaponModal = ref(false) // 是否顯示基礎武器詳情彈窗（用於概率頁面）
+const selectedBaseWeapon = ref(null) // 選中的基礎武器數據（用於概率頁面）
 
 // 進入升級模式
 const enterUpgradeMode = () => {
@@ -661,7 +1051,12 @@ const toggleSacrificeAxe = (index) => {
 }
 
 // 按稀有度批量選擇/取消選擇獻祭武器
-const toggleSacrificeByRarity = (rarity) => {
+const toggleSacrificeByRarity = (rarity, event) => {
+  // 防止事件冒泡，避免觸發其他點擊事件
+  if (event) {
+    event.stopPropagation()
+  }
+  
   // 獲取該稀有度的所有武器索引
   const rarityIndices = inventory.value
     .map((axe, index) => ({ axe, index }))
@@ -673,7 +1068,10 @@ const toggleSacrificeByRarity = (rarity) => {
     })
     .map(({ index }) => index)
   
-  if (rarityIndices.length === 0) return
+  if (rarityIndices.length === 0) {
+    showNotification('該稀有度沒有可獻祭的武器', 'info')
+    return
+  }
   
   // 檢查該稀有度的所有武器是否都已選中
   const allSelected = rarityIndices.every(idx => selectedSacrificeAxeIndices.value.includes(idx))
@@ -686,13 +1084,16 @@ const toggleSacrificeByRarity = (rarity) => {
         selectedSacrificeAxeIndices.value.splice(index, 1)
       }
     })
+    showNotification(`已取消選擇 ${rarityIndices.length} 把 ${RARITY[rarity]?.name || rarity} 武器`, 'info')
   } else {
     // 如果未全部選中，則添加所有未選中的
+    const addedCount = rarityIndices.filter(idx => !selectedSacrificeAxeIndices.value.includes(idx)).length
     rarityIndices.forEach(idx => {
       if (!selectedSacrificeAxeIndices.value.includes(idx)) {
         selectedSacrificeAxeIndices.value.push(idx)
       }
     })
+    showNotification(`已選擇 ${addedCount} 把 ${RARITY[rarity]?.name || rarity} 武器`, 'info')
   }
 }
 
@@ -737,8 +1138,23 @@ const closeWeaponModal = () => {
   selectedWeaponIndex.value = null
 }
 
+// 顯示基礎武器詳情彈窗（用於概率頁面）
+const showBaseWeaponDetails = (weapon) => {
+  selectedBaseWeapon.value = weapon
+  showBaseWeaponModal.value = true
+}
+
+// 關閉基礎武器詳情彈窗
+const closeBaseWeaponModal = () => {
+  showBaseWeaponModal.value = false
+  selectedBaseWeapon.value = null
+}
+
 // 獻祭升級（隨機提升攻擊間隔，支持多選）
-const sacrificeUpgrade = () => {
+const sacrificeUpgrade = async () => {
+  // 更新活動時間
+  updateActivityTime()
+  
   if (selectedUpgradeAxeIndex.value === null || selectedSacrificeAxeIndices.value.length === 0) {
     showNotification('請選擇要升級的斧頭和至少一把要獻祭的斧頭！', 'error')
     return
@@ -815,34 +1231,9 @@ const sacrificeUpgrade = () => {
   const newInterval = Math.max(minInterval, Math.floor(originalInterval * (1 - effectiveBoost)))
   upgradeAxe.attackInterval = newInterval
   
-  // 保存索引，因為splice後會改變
+  // 保存索引（僅用於本地模式計算）
   const upgradeIndex = selectedUpgradeAxeIndex.value
   const isCurrentAxeBeingUpgraded = currentAxeIndex.value === upgradeIndex
-  
-  // 計算升級斧頭的新索引（刪除獻祭武器後）
-  let newUpgradeIndex = upgradeIndex
-  for (const sacrificeIndex of sortedSacrificeIndices) {
-    if (sacrificeIndex < upgradeIndex) {
-      newUpgradeIndex--
-    }
-  }
-  
-  // 從背包中移除被獻祭的斧頭（從後往前刪除，避免索引問題）
-  for (const sacrificeIndex of sortedSacrificeIndices) {
-    inventory.value.splice(sacrificeIndex, 1)
-    
-    // 調整當前使用斧頭的索引
-    if (currentAxeIndex.value !== null && currentAxeIndex.value > sacrificeIndex) {
-      currentAxeIndex.value--
-    }
-  }
-  
-  // 如果升級的是當前使用的斧頭，更新索引並重啟計時器
-  if (isCurrentAxeBeingUpgraded) {
-    currentAxeIndex.value = newUpgradeIndex
-    stopCurrentAttackTimer()
-    startCurrentAttackTimer()
-  }
   
   // 計算實際的提升百分比（考慮上限）
   const actualBoostPercent = ((originalInterval - newInterval) / originalInterval * 100).toFixed(1)
@@ -850,11 +1241,71 @@ const sacrificeUpgrade = () => {
   const oldInterval = (originalInterval / 1000).toFixed(1)
   const newIntervalDisplay = (newInterval / 1000).toFixed(1)
   
-  totalSacrificeCount.value++
-  showNotification(`獻祭成功！${upgradeAxe.name} 攻擊間隔減少 ${actualBoostPercent}% (${oldInterval}秒 → ${newIntervalDisplay}秒)`, 'success')
+  // 如果是管理員或用戶沒有 UID，直接操作（本地模式）
+  if (props.user.isAdmin || !props.user.uid) {
+    // 本地模式下，直接從前端移除被獻祭的武器
+    const sortedIndices = [...sortedSacrificeIndices]
+    for (const sacrificeIndex of sortedIndices) {
+      inventory.value.splice(sacrificeIndex, 1)
+      
+      // 調整當前使用斧頭的索引
+      if (currentAxeIndex.value !== null && currentAxeIndex.value > sacrificeIndex) {
+        currentAxeIndex.value--
+      }
+    }
+    
+    // 如果升級的是當前使用的斧頭，更新索引並重啟計時器
+    if (isCurrentAxeBeingUpgraded) {
+      let newUpgradeIndex = upgradeIndex
+      for (const sacrificeIndex of sortedIndices) {
+        if (sacrificeIndex < upgradeIndex) {
+          newUpgradeIndex--
+        }
+      }
+      currentAxeIndex.value = newUpgradeIndex
+      stopCurrentAttackTimer()
+      startCurrentAttackTimer()
+    }
+    
+    totalSacrificeCount.value++
+    showNotification(`獻祭成功！${upgradeAxe.name} 攻擊間隔減少 ${actualBoostPercent}% (${oldInterval}秒 → ${newIntervalDisplay}秒)`, 'success')
+    saveGameDataToFirestore(true)
+    cancelUpgradeMode()
+    return
+  }
   
-  // 重置升級模式
-  cancelUpgradeMode()
+  // Firebase 用戶：通過服務器端驗證
+  try {
+    const result = await sacrificeUpgradeWithValidation(
+      props.user.uid,
+      selectedUpgradeAxeIndex.value,
+      selectedSacrificeAxeIndices.value,
+      upgradeAxe,
+      gold.value
+    )
+    
+    // 使用後端返回的背包、當前武器索引和金錢，避免前後端數據不一致
+    inventory.value = result.inventory
+    currentAxeIndex.value = result.currentAxeIndex
+    if (result.gold !== undefined) {
+      gold.value = result.gold // 同步後端金錢
+    }
+    totalSacrificeCount.value++
+    
+    // 如果當前有裝備武器，重新啟動計時器；否則停止
+    if (currentAxeIndex.value !== null && inventory.value[currentAxeIndex.value]) {
+      stopCurrentAttackTimer()
+      startCurrentAttackTimer()
+    } else {
+      stopCurrentAttackTimer()
+    }
+    
+    showNotification(`獻祭成功！${upgradeAxe.name} 攻擊間隔減少 ${actualBoostPercent}% (${oldInterval}秒 → ${newIntervalDisplay}秒)`, 'success')
+    cancelUpgradeMode()
+  } catch (error) {
+    console.error('獻祭升級失敗:', error)
+    showNotification(error.message || '獻祭升級失敗', 'error')
+  }
 }
 
 // 通知系統
@@ -994,7 +1445,148 @@ const totalSacrificeCount = ref(0) // 總獻祭次數
 const legendaryCount = ref(0) // 傳說級武器數量
 const epicCount = ref(0) // 史詩級武器數量
 const maxWeaponLevel = ref(0) // 最高武器等級
+
+// 註：已移除樂觀更新機制，現在所有數據都直接從後端返回
+
+// 離線收益定期檢查機制
+const offlineRewardCheckTimer = ref(null) // 離線收益檢查定時器
+const OFFLINE_REWARD_CHECK_INTERVAL = 60000 // 每1分鐘檢查一次離線收益
+const lastOfflineRewardCheck = ref(Date.now()) // 上次檢查離線收益的時間
 const treeDefeatedCount = ref(0) // 擊敗樹的次數
+
+// 保存遊戲資料到 Firestore
+const saveGameDataToFirestore = async (immediate = false) => {
+  // 如果是測試用戶，不保存
+  if (props.user.isAdmin || !props.user.uid) {
+    return
+  }
+  
+  // 如果正在保存，且不是立即保存，則跳過
+  if (isSaving.value && !immediate) {
+    return
+  }
+  
+  try {
+    isSaving.value = true
+    
+    // 序列化成就數據（只保存解鎖狀態）
+    const achievementsData = achievements.value.map(a => ({
+      id: a.id,
+      unlocked: a.unlocked,
+      progress: a.progress || 0
+    }))
+    
+    await saveGameData(props.user.uid, {
+      gold: gold.value,
+      inventory: inventory.value,
+      currentAxeIndex: currentAxeIndex.value,
+      totalDamage: totalDamage.value,
+      totalGoldEarned: totalGoldEarned.value,
+      totalDrawCount: totalDrawCount.value,
+      totalSacrificeCount: totalSacrificeCount.value,
+      legendaryCount: legendaryCount.value,
+      epicCount: epicCount.value,
+      maxWeaponLevel: maxWeaponLevel.value,
+      treeDefeatedCount: treeDefeatedCount.value,
+      achievements: achievementsData
+    })
+    
+    if (immediate) {
+      console.log('✓ 遊戲資料已保存')
+    }
+  } catch (error) {
+    console.error('保存遊戲資料失敗:', error)
+  } finally {
+    isSaving.value = false
+  }
+}
+
+// 加載遊戲資料從 Firestore
+const loadGameDataFromFirestore = async () => {
+  // 如果是管理員或用戶沒有 UID，不加載
+  if (props.user.isAdmin || !props.user.uid) {
+    return
+  }
+  
+  try {
+    // 先從 props.user.gameData 加載（如果有的話）
+    if (props.user.gameData) {
+      const data = props.user.gameData
+      gold.value = data.gold || gold.value
+      inventory.value = data.inventory || []
+      currentAxeIndex.value = data.currentAxeIndex !== null ? data.currentAxeIndex : null
+      totalDamage.value = data.totalDamage || 0
+      totalGoldEarned.value = data.totalGoldEarned || 0
+      totalDrawCount.value = data.totalDrawCount || 0
+      totalSacrificeCount.value = data.totalSacrificeCount || 0
+      legendaryCount.value = data.legendaryCount || 0
+      epicCount.value = data.epicCount || 0
+      maxWeaponLevel.value = data.maxWeaponLevel || 0
+      treeDefeatedCount.value = data.treeDefeatedCount || 0
+      
+      // 恢復成就狀態
+      if (data.achievements && Array.isArray(data.achievements)) {
+        data.achievements.forEach(savedAchievement => {
+          const achievement = achievements.value.find(a => a.id === savedAchievement.id)
+          if (achievement) {
+            achievement.unlocked = savedAchievement.unlocked || false
+            achievement.progress = savedAchievement.progress || 0
+          }
+        })
+      }
+      
+      // 如果有背包數據，自動裝備第一把武器（如果沒有當前武器）
+      if (inventory.value.length > 0 && currentAxeIndex.value === null) {
+        currentAxeIndex.value = 0
+        startCurrentAttackTimer()
+      } else if (currentAxeIndex.value !== null && inventory.value[currentAxeIndex.value]) {
+        startCurrentAttackTimer()
+      }
+      
+      console.log('✓ 遊戲資料已加載')
+      return
+    }
+    
+    // 如果 props 中沒有，從 Firestore 加載
+    const data = await loadGameData(props.user.uid)
+    if (data) {
+      gold.value = data.gold || gold.value
+      inventory.value = data.inventory || []
+      currentAxeIndex.value = data.currentAxeIndex !== null ? data.currentAxeIndex : null
+      totalDamage.value = data.totalDamage || 0
+      totalGoldEarned.value = data.totalGoldEarned || 0
+      totalDrawCount.value = data.totalDrawCount || 0
+      totalSacrificeCount.value = data.totalSacrificeCount || 0
+      legendaryCount.value = data.legendaryCount || 0
+      epicCount.value = data.epicCount || 0
+      maxWeaponLevel.value = data.maxWeaponLevel || 0
+      treeDefeatedCount.value = data.treeDefeatedCount || 0
+      
+      // 恢復成就狀態
+      if (data.achievements && Array.isArray(data.achievements)) {
+        data.achievements.forEach(savedAchievement => {
+          const achievement = achievements.value.find(a => a.id === savedAchievement.id)
+          if (achievement) {
+            achievement.unlocked = savedAchievement.unlocked || false
+            achievement.progress = savedAchievement.progress || 0
+          }
+        })
+      }
+      
+      // 如果有背包數據，自動裝備第一把武器（如果沒有當前武器）
+      if (inventory.value.length > 0 && currentAxeIndex.value === null) {
+        currentAxeIndex.value = 0
+        startCurrentAttackTimer()
+      } else if (currentAxeIndex.value !== null && inventory.value[currentAxeIndex.value]) {
+        startCurrentAttackTimer()
+      }
+      
+      console.log('✓ 遊戲資料已從 Firestore 加載')
+    }
+  } catch (error) {
+    console.error('加載遊戲資料失敗:', error)
+  }
+}
 
 // 檢查成就
 const checkAchievement = async (achievementId) => {
@@ -1004,24 +1596,20 @@ const checkAchievement = async (achievementId) => {
   achievement.unlocked = true
   showNotification(`🏆 達成成就：${achievement.name}！`, 'success')
   
-  // 發送成就公告
-  const userName = props.user.displayName || props.user.email || '未知玩家'
-  const userId = props.user.uid
+  // 立即保存（達成成就時）
+  saveGameDataToFirestore(true)
   
-  if (isMultiplayerReady.value && !props.user.isTest) {
+  // 發送成就公告（管理員不發送）
+  if (!props.user.isAdmin && isMultiplayerReady.value) {
+    const userName = props.user.displayName || props.user.email || '未知玩家'
+    const userId = props.user.uid
     try {
       await sendAchievementAnnouncement(userId, userName, achievement.name)
     } catch (error) {
       console.error('發送成就公告失敗:', error)
     }
-  } else {
-    // 測試模式或未連接 Firebase，使用本地存儲
-    sendLocalAchievementAnnouncement(userId, userName, achievement.name)
-    // 觸發本地消息更新
-    if (isChatReady.value) {
-      chatMessages.value = getLocalMessages()
-    }
   }
+  // 測試玩家不發送成就公告到聊天室
 }
 
 // 更新成就進度
@@ -1063,13 +1651,34 @@ const updateAchievementProgress = () => {
 }
 
 // 更新單個成就進度
-const updateAchievement = (achievementId, progress) => {
+const updateAchievement = async (achievementId, progress) => {
   const achievement = achievements.value.find(a => a.id === achievementId)
   if (!achievement) return
   
+  // 如果成就已經解鎖，只更新進度值，不再次觸發解鎖
+  if (achievement.unlocked) {
+    achievement.progress = progress
+    return
+  }
+  
   achievement.progress = progress
-  if (progress >= achievement.target && !achievement.unlocked) {
-    checkAchievement(achievementId)
+  // 只有在進度達到目標且尚未解鎖時才觸發解鎖
+  if (progress >= achievement.target) {
+    await checkAchievement(achievementId)
+  }
+  
+  // 如果是 Firebase 用戶（非管理員），同步到服務器
+  if (!props.user.isAdmin && props.user.uid) {
+    try {
+      await updateAchievementInFirestore(
+        props.user.uid,
+        achievementId,
+        achievement.unlocked,
+        progress
+      )
+    } catch (error) {
+      console.error('更新成就到服務器失敗:', error)
+    }
   }
 }
 
@@ -1083,17 +1692,32 @@ const achievementProgress = computed(() => {
   }
 })
 
-// 初始化多人遊戲
+// 初始化多人遊戲（必須成功，不允許單人模式）
 const initMultiplayer = async () => {
-  // 如果是測試用戶，跳過多人遊戲初始化
-  if (props.user.isTest || (props.user.uid && props.user.uid.startsWith('test-'))) {
+  // 管理員可以跳過多人遊戲初始化
+  if (props.user.isAdmin || (props.user.uid && (props.user.uid.startsWith('test-') || props.user.uid.startsWith('admin-')))) {
+    console.log('跳過多人遊戲初始化：用戶是管理員或測試用戶')
+    isMultiplayerReady.value = true // 管理員視為已連接
+    multiplayerError.value = null
+    return
+  }
+  
+  // 檢查是否有有效的 UID（非管理員必須有 UID）
+  if (!props.user.uid) {
+    const errorMsg = '無法初始化多人模式：用戶沒有有效的 UID'
+    console.error('❌', errorMsg)
+    multiplayerError.value = errorMsg
     isMultiplayerReady.value = false
+    showNotification(errorMsg, 'error')
     return
   }
   
   try {
+    console.log('開始初始化多人遊戲...')
+    
     // 初始化遊戲狀態
     await initGameState()
+    console.log('✓ 遊戲狀態初始化成功')
     
     // 標記玩家在線
     await setUserOnline(props.user.uid, {
@@ -1103,10 +1727,21 @@ const initMultiplayer = async () => {
       currentWeapon: currentAxe.value?.name || '無',
       totalDamage: totalDamage.value
     })
+    console.log('✓ 玩家在線狀態設置成功')
     
     // 監聽遊戲狀態變化
     let previousHealth = treeHealth.value
+    let isInitialLoad = true // 標記是否為初始載入
     gameStateUnsubscribe.value = subscribeGameState(async (state) => {
+      // 跳過第一次載入（初始狀態），避免誤判
+      if (isInitialLoad) {
+        previousHealth = state.treeHealth
+        treeHealth.value = state.treeHealth
+        maxTreeHealth.value = state.maxTreeHealth
+        isInitialLoad = false
+        return
+      }
+      
       const wasDefeated = previousHealth > 0 && state.treeHealth === state.maxTreeHealth
       previousHealth = state.treeHealth
       
@@ -1120,37 +1755,287 @@ const initMultiplayer = async () => {
         showNotification('🎉 樹大招風被擊敗了！所有玩家共同努力的成果！', 'success')
       }
     })
+    console.log('✓ 遊戲狀態監聽器設置成功')
     
     // 監聽最近的攻擊記錄
     attacksUnsubscribe.value = subscribeRecentAttacks((attacks) => {
       recentAttacks.value = attacks
     }, 10)
+    console.log('✓ 攻擊記錄監聽器設置成功')
     
     // 監聽在線玩家列表
     usersUnsubscribe.value = subscribeOnlineUsers((users) => {
       onlineUsers.value = users.filter(user => user.id !== props.user.uid)
     })
+    console.log('✓ 在線玩家監聽器設置成功')
     
     isMultiplayerReady.value = true
+    multiplayerError.value = null
+    console.log('✅ 多人遊戲初始化完成！')
+    showNotification('✅ 多人模式連接成功！', 'success')
   } catch (error) {
-    console.error('多人遊戲初始化失敗:', error)
+    console.error('❌ 多人遊戲初始化失敗:', error)
+    console.error('錯誤詳情:', {
+      message: error.message,
+      code: error.code,
+      stack: error.stack
+    })
     isMultiplayerReady.value = false
+    
+    // 構建詳細的錯誤訊息
+    let errorMessage = '無法連接多人模式：'
+    if (error.code === 'permission-denied') {
+      errorMessage = '無法連接多人模式：權限不足。請確認 Firestore 規則已正確設置。'
+    } else if (error.code === 'unavailable') {
+      errorMessage = '無法連接多人模式：Firebase 服務暫時不可用，請稍後再試。'
+    } else if (error.code === 'failed-precondition') {
+      errorMessage = '無法連接多人模式：Firestore 規則驗證失敗。請檢查規則設置。'
+    } else if (error.message) {
+      errorMessage = '無法連接多人模式：' + error.message
+    } else {
+      errorMessage = '無法連接多人模式：未知錯誤，請檢查網絡連接和 Firebase 配置。'
+    }
+    
+    multiplayerError.value = errorMessage
+    showNotification(errorMessage, 'error')
+    
+    // 阻止遊戲繼續（不允許單人模式）
+    throw error // 重新拋出錯誤，讓調用者知道初始化失敗
   }
 }
 
 // 初始化成就進度
 onMounted(async () => {
+  // 從 Firestore 加載武器數據
+  try {
+    const weapons = await getAllWeapons()
+    if (weapons && weapons.length > 0) {
+      cardDatabase.value = weapons
+      console.log('✓ 武器數據加載成功:', weapons.length, '把武器')
+    } else {
+      console.warn('⚠ Firestore 中沒有武器數據，使用備用數據')
+      cardDatabase.value = fallbackWeaponDatabase
+    }
+  } catch (error) {
+    console.error('❌ 加載武器數據失敗，使用備用數據:', error)
+    cardDatabase.value = fallbackWeaponDatabase
+  }
+  
+  // 加載玩家遊戲資料
+  await loadGameDataFromFirestore()
+  
+  // 檢查並應用離線收益（管理員不需要）
+  // 注意：不依賴 currentAxe.value，因為離線狀態已經保存在 Firestore 中
+  if (!props.user.isAdmin && props.user.uid) {
+    try {
+      console.log('開始檢查離線收益...')
+      const rewards = await calculateOfflineRewards(props.user.uid)
+      console.log('離線收益計算結果:', rewards)
+      
+      if (rewards && rewards.attackCount > 0) {
+        console.log('應用離線收益:', rewards)
+        const result = await applyOfflineRewards(props.user.uid, rewards)
+        
+        // 更新本地狀態
+        gold.value = result.newGold
+        totalDamage.value = result.newTotalDamage
+        totalGoldEarned.value = result.newTotalGoldEarned
+        
+        // 顯示離線收益通知
+        showNotification(
+          `💰 離線收益：${rewards.offlineHours}小時內攻擊 ${rewards.attackCount} 次，造成 ${rewards.totalDamage} 傷害，獲得 ${rewards.totalGoldEarned} 金錢！`,
+          'success'
+        )
+        console.log('✓ 離線收益已應用並顯示')
+      } else {
+        console.log('沒有離線收益（可能是首次登入或離線時間太短）')
+      }
+    } catch (error) {
+      console.error('處理離線收益失敗:', error)
+      // 即使失敗也不影響遊戲繼續
+    }
+  }
+  
   updateAchievementProgress()
-  // 初始化多人遊戲
-  await initMultiplayer()
-  // 初始化聊天室
-  await initChat()
+  
+  // 初始化多人遊戲（必須成功，不允許單人模式）
+  try {
+    await initMultiplayer()
+    // 只有多人模式連接成功後才初始化聊天室
+    await initChat()
+  } catch (error) {
+    // 多人模式初始化失敗，阻止遊戲繼續
+    console.error('❌ 多人模式初始化失敗，遊戲無法繼續:', error)
+    // 錯誤已在 initMultiplayer 中顯示給用戶
+    // 不繼續執行後續初始化（如聊天室）
+    return
+  }
+  
+  // 啟動自動保存（每30秒保存一次，管理員不需要）
+  if (!props.user.isAdmin && props.user.uid) {
+    saveTimer.value = setInterval(() => {
+      saveGameDataToFirestore(false)
+    }, 30000) // 30秒
+  }
+  
+  // 啟動活動檢查計時器（每10秒檢查一次，如果1分鐘沒有活動，保存離線狀態）
+  if (!props.user.isAdmin && props.user.uid) {
+    activityCheckInterval.value = setInterval(() => {
+      const timeSinceActivity = Date.now() - lastActivityTime.value
+      const INACTIVE_THRESHOLD = 60 * 1000 // 1分鐘
+      
+      // 如果1分鐘沒有活動，且當前有裝備武器，保存離線狀態
+      if (timeSinceActivity >= INACTIVE_THRESHOLD && currentAxe.value && isMultiplayerReady.value) {
+        const weaponId = currentAxe.value.baseId || currentAxe.value.id
+        const weaponLevel = currentAxe.value.level || 1
+        const attackInterval = currentAxe.value.attackInterval || 2000
+        
+        // 記錄停止活動的時間（1分鐘前）
+        const inactiveStartTime = new Date(lastActivityTime.value + INACTIVE_THRESHOLD)
+        
+        saveOfflineState(props.user.uid, weaponId, weaponLevel, attackInterval, inactiveStartTime)
+          .then(() => {
+            console.log('✓ 離線狀態已保存（1分鐘無活動）')
+          })
+          .catch(err => {
+            console.error('保存離線狀態失敗:', err)
+          })
+      }
+    }, 10000) // 每10秒檢查一次
+  }
+  
+  // 註：已移除金錢批量同步定時器，現在所有數據都直接從後端返回
+  
+  // 啟動離線收益定期檢查定時器（每1分鐘檢查一次，用於掛機時自動計算收益）
+  if (!props.user.isAdmin && props.user.uid) {
+    offlineRewardCheckTimer.value = setInterval(() => {
+      checkAndApplyOfflineRewards()
+    }, OFFLINE_REWARD_CHECK_INTERVAL)
+    console.log('✓ 離線收益定期檢查已啟動（每1分鐘檢查一次）')
+  }
+  
+  // 監聽頁面可見性變化（用於離線掛機，管理員不需要）
+  if (!props.user.isAdmin && props.user.uid) {
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+    window.addEventListener('beforeunload', handleBeforeUnload)
+  }
 })
+
+// 處理頁面可見性變化（用於離線掛機）
+const handleVisibilityChange = async () => {
+  if (document.hidden) {
+    // 頁面隱藏時，如果1分鐘內有活動，則從活動時間開始計算；否則立即保存離線狀態
+    if (currentAxe.value && !props.user.isAdmin && props.user.uid) {
+      try {
+        const weaponId = currentAxe.value.baseId || currentAxe.value.id
+        const weaponLevel = currentAxe.value.level || 1
+        const attackInterval = currentAxe.value.attackInterval || 2000
+        
+        // 計算不活動開始時間：如果最後活動時間在1分鐘內，則從1分鐘後開始計算
+        const timeSinceActivity = Date.now() - lastActivityTime.value
+        const INACTIVE_THRESHOLD = 60 * 1000 // 1分鐘
+        const inactiveStartTime = timeSinceActivity < INACTIVE_THRESHOLD
+          ? new Date(lastActivityTime.value + INACTIVE_THRESHOLD)
+          : new Date(lastActivityTime.value + INACTIVE_THRESHOLD)
+        
+        await saveOfflineState(props.user.uid, weaponId, weaponLevel, attackInterval, inactiveStartTime)
+        console.log('✓ 離線狀態已保存（頁面隱藏）')
+      } catch (error) {
+        console.error('保存離線狀態失敗:', error)
+      }
+    }
+  } else {
+    // 頁面顯示時，先檢查並應用離線收益，然後清除離線狀態
+    // 注意：不要在 onMounted 之前清除，因為 onMounted 需要讀取離線狀態
+    // 這裡只清除，離線收益應該在 onMounted 中處理
+    if (!props.user.isAdmin && props.user.uid) {
+      // 延遲清除，確保 onMounted 中的離線收益檢查已經完成
+      setTimeout(async () => {
+        try {
+          await clearOfflineState(props.user.uid)
+          console.log('✓ 離線狀態已清除（頁面顯示後）')
+        } catch (error) {
+          console.error('清除離線狀態失敗:', error)
+        }
+      }, 5000) // 5秒後清除，確保離線收益已經處理
+    }
+  }
+}
+
+// 處理頁面卸載前（用於離線掛機）
+const handleBeforeUnload = async () => {
+  if (currentAxe.value && !props.user.isAdmin && props.user.uid) {
+    try {
+      const weaponId = currentAxe.value.baseId || currentAxe.value.id
+      const weaponLevel = currentAxe.value.level || 1
+      const attackInterval = currentAxe.value.attackInterval || 2000
+      
+      // 計算不活動開始時間：如果最後活動時間在1分鐘內，則從1分鐘後開始計算
+      const timeSinceActivity = Date.now() - lastActivityTime.value
+      const INACTIVE_THRESHOLD = 60 * 1000 // 1分鐘
+      const inactiveStartTime = timeSinceActivity < INACTIVE_THRESHOLD
+        ? new Date(lastActivityTime.value + INACTIVE_THRESHOLD)
+        : new Date(lastActivityTime.value + INACTIVE_THRESHOLD)
+      
+      // 使用 sendBeacon 或同步方式保存（因為頁面即將關閉）
+      await saveOfflineState(props.user.uid, weaponId, weaponLevel, attackInterval, inactiveStartTime)
+    } catch (error) {
+      console.error('保存離線狀態失敗:', error)
+    }
+  }
+}
 
 // 清理攻擊計時器和通知計時器
 onUnmounted(async () => {
   stopCurrentAttackTimer()
   hideNotification()
+  
+  // 清理自動保存計時器
+  if (saveTimer.value) {
+    clearInterval(saveTimer.value)
+    saveTimer.value = null
+  }
+  
+  // 清理活動檢查計時器
+  if (activityCheckInterval.value) {
+    clearInterval(activityCheckInterval.value)
+    activityCheckInterval.value = null
+  }
+  
+  // 清理離線收益檢查定時器
+  if (offlineRewardCheckTimer.value) {
+    clearInterval(offlineRewardCheckTimer.value)
+    offlineRewardCheckTimer.value = null
+  }
+  
+  // 註：已移除金錢同步邏輯，現在所有數據都直接從後端返回
+  
+  // 保存離線狀態
+  if (currentAxe.value && !props.user.isAdmin && props.user.uid) {
+    try {
+      const weaponId = currentAxe.value.baseId || currentAxe.value.id
+      const weaponLevel = currentAxe.value.level || 1
+      const attackInterval = currentAxe.value.attackInterval || 2000
+      
+      // 計算不活動開始時間：如果最後活動時間在1分鐘內，則從1分鐘後開始計算
+      const timeSinceActivity = Date.now() - lastActivityTime.value
+      const INACTIVE_THRESHOLD = 60 * 1000 // 1分鐘
+      const inactiveStartTime = timeSinceActivity < INACTIVE_THRESHOLD
+        ? new Date(lastActivityTime.value + INACTIVE_THRESHOLD)
+        : new Date(lastActivityTime.value + INACTIVE_THRESHOLD)
+      
+      await saveOfflineState(props.user.uid, weaponId, weaponLevel, attackInterval, inactiveStartTime)
+    } catch (error) {
+      console.error('保存離線狀態失敗:', error)
+    }
+  }
+  
+  // 移除事件監聽器
+  document.removeEventListener('visibilitychange', handleVisibilityChange)
+  window.removeEventListener('beforeunload', handleBeforeUnload)
+  
+  // 最後一次保存遊戲資料
+  await saveGameDataToFirestore(true)
   
   // 清理多人遊戲監聽器
   if (gameStateUnsubscribe.value) {
@@ -1194,6 +2079,44 @@ watch(currentPage, (newPage) => {
 watch(chatMessages, () => {
   scrollChatToBottom()
 }, { deep: true })
+
+// 清除所有玩家資料（僅管理員模式）
+const handleClearAllPlayersData = async () => {
+  if (!props.user.isAdmin) {
+    showNotification('此功能僅限系統管理員使用', 'error')
+    return
+  }
+  
+  // 確認對話框
+  const confirmed = confirm('⚠️ 警告：此操作將清除 Firestore 中所有玩家的資料！\n\n這包括：\n- 所有玩家的金錢、背包、成就\n- 所有玩家的遊戲進度\n\n此操作無法復原！\n\n確定要繼續嗎？')
+  
+  if (!confirmed) {
+    return
+  }
+  
+  // 二次確認
+  const confirmedAgain = confirm('⚠️ 最後確認：\n\n你真的要清除所有玩家的資料嗎？\n\n此操作無法復原！')
+  
+  if (!confirmedAgain) {
+    return
+  }
+  
+  try {
+    isClearingData.value = true
+    const result = await clearAllPlayersData()
+    showNotification(`✅ 成功清除 ${result.deletedCount} 個玩家的資料！遊戲已重置！`, 'success')
+    
+    // 延遲一下讓用戶看到通知
+    setTimeout(() => {
+      // 重新加載頁面以刷新狀態
+      window.location.reload()
+    }, 2000)
+  } catch (error) {
+    console.error('清除所有玩家資料失敗:', error)
+    showNotification('清除資料失敗：' + (error.message || '未知錯誤'), 'error')
+    isClearingData.value = false
+  }
+}
 </script>
 
 <template>
@@ -1227,6 +2150,16 @@ watch(chatMessages, () => {
           <span class="value">{{ totalAttack }}</span>
         </div>
       </div>
+      <!-- 系統管理員專用：清除所有玩家資料按鈕 -->
+      <div v-if="user.isAdmin" class="admin-panel">
+        <button 
+          class="clear-all-data-btn"
+          @click="handleClearAllPlayersData"
+          :disabled="isClearingData"
+        >
+          {{ isClearingData ? '清除中...' : '🗑️ 清除所有玩家資料' }}
+        </button>
+      </div>
     </header>
 
     <!-- 主要內容區域 -->
@@ -1239,10 +2172,14 @@ watch(chatMessages, () => {
             <h2>樹大招風</h2>
             <div class="multiplayer-status" :class="{ 'online': isMultiplayerReady, 'offline': !isMultiplayerReady }">
               <span class="status-dot"></span>
-              <span>{{ isMultiplayerReady ? '多人模式' : '單人模式' }}</span>
+              <span>{{ isMultiplayerReady ? '多人模式' : '連接中...' }}</span>
               <span v-if="isMultiplayerReady && onlineUsers.length > 0" class="online-count">
                 ({{ onlineUsers.length }} 人在線)
               </span>
+            </div>
+            <div v-if="multiplayerError" class="multiplayer-error">
+              <span class="error-icon">⚠️</span>
+              <span>{{ multiplayerError }}</span>
             </div>
           </div>
           <div class="tree-container">
@@ -1429,7 +2366,7 @@ watch(chatMessages, () => {
                         ? rarityInfo.color + '40' 
                         : 'transparent'
                   }"
-                  @click="toggleSacrificeByRarity(rarity)"
+                  @click.stop="toggleSacrificeByRarity(rarity, $event)"
                   :disabled="getRarityTotalCount(rarity) === 0"
                 >
                   <span class="rarity-btn-icon">{{ rarityInfo.name }}</span>
@@ -1504,7 +2441,7 @@ watch(chatMessages, () => {
           
           <div class="chat-messages-container" ref="chatContainer">
             <div 
-              v-for="message in chatMessages" 
+              v-for="message in filteredChatMessages" 
               :key="message.id"
               class="chat-message"
               :class="{
@@ -1515,11 +2452,11 @@ watch(chatMessages, () => {
             >
               <div class="message-header">
                 <span class="message-user">{{ message.userName }}</span>
-                <span class="message-time">{{ formatDateTime(message.timestamp || message.createdAt) }}</span>
+                <span class="message-time">{{ formatTime(message.timestamp || message.createdAt) }}</span>
               </div>
               <div class="message-content">{{ message.message }}</div>
             </div>
-            <div v-if="chatMessages.length === 0" class="no-messages">
+            <div v-if="filteredChatMessages.length === 0" class="no-messages">
               還沒有消息，快來發送第一條消息吧！
             </div>
           </div>
@@ -1531,12 +2468,12 @@ watch(chatMessages, () => {
               class="chat-input"
               placeholder="輸入消息..."
               @keypress="(e) => e.key === 'Enter' && sendChatMessage()"
-              :disabled="!isChatReady"
+              :disabled="!isChatReady || user.isAdmin"
             />
             <button 
               class="chat-send-button"
               @click="sendChatMessage"
-              :disabled="!isChatReady || !chatInput.trim()"
+              :disabled="!isChatReady || !chatInput.trim() || user.isAdmin"
             >
               發送
             </button>
@@ -1668,7 +2605,7 @@ watch(chatMessages, () => {
               
               <!-- 輪播內容區域 -->
               <div class="carousel-content" v-if="getCurrentCard(rarity)">
-                <div class="carousel-card-display">
+                <div class="carousel-card-display clickable-card" @click="showBaseWeaponDetails(getCurrentCard(rarity))">
                   <div class="carousel-card-icon">{{ getCurrentCard(rarity).icon }}</div>
                   <div class="carousel-card-name">{{ getCurrentCard(rarity).name }}</div>
                   <div class="carousel-card-description">{{ getCurrentCard(rarity).description }}</div>
@@ -1677,6 +2614,9 @@ watch(chatMessages, () => {
                   </div>
                   <div class="carousel-card-index">
                     {{ (carouselIndices[rarity] || 0) + 1 }} / {{ cards.length }}
+                  </div>
+                  <div class="carousel-card-hint" style="margin-top: 8px; font-size: 0.85em; color: rgba(255, 255, 255, 0.7);">
+                    點擊查看詳細屬性
                   </div>
                 </div>
                 
@@ -1778,7 +2718,7 @@ watch(chatMessages, () => {
       </button>
     </div>
 
-    <!-- 武器詳情彈窗 -->
+    <!-- 武器詳情彈窗（背包中的武器） -->
     <transition name="modal-fade">
       <div v-if="showWeaponModal && selectedWeaponIndex !== null" class="modal-overlay" @click="closeWeaponModal">
         <div class="modal-content-weapon" @click.stop>
@@ -1835,6 +2775,55 @@ watch(chatMessages, () => {
         </div>
       </div>
     </transition>
+
+    <!-- 基礎武器詳情彈窗（概率頁面） -->
+    <transition name="modal-fade">
+      <div v-if="showBaseWeaponModal && selectedBaseWeapon" class="modal-overlay" @click="closeBaseWeaponModal">
+        <div class="modal-content-weapon" @click.stop>
+          <div class="modal-header-weapon">
+            <h2>武器屬性</h2>
+            <button class="modal-close-weapon" @click="closeBaseWeaponModal">×</button>
+          </div>
+          <div class="modal-body-weapon">
+            <div class="weapon-detail-card" :class="'rarity-' + (selectedBaseWeapon.rarity || 'COMMON')">
+              <div class="card-rarity-badge" :style="{ backgroundColor: RARITY[selectedBaseWeapon.rarity || 'COMMON'].color }">
+                {{ RARITY[selectedBaseWeapon.rarity || 'COMMON'].name }}
+              </div>
+              <div class="card-icon">{{ selectedBaseWeapon.icon || '🪓' }}</div>
+              <div class="card-name">{{ selectedBaseWeapon.name }}</div>
+              <div class="card-description">{{ selectedBaseWeapon.description }}</div>
+              <div class="card-stats">
+                <div class="stat">
+                  <span class="stat-label">攻擊力：</span>
+                  <span class="stat-value">{{ selectedBaseWeapon.attack }}</span>
+                </div>
+                <div class="stat">
+                  <span class="stat-label">攻擊間隔：</span>
+                  <span class="stat-value">{{ (selectedBaseWeapon.attackInterval / 1000).toFixed(1) }}秒</span>
+                </div>
+                <div class="stat">
+                  <span class="stat-label">金錢機率：</span>
+                  <span class="stat-value">{{ (selectedBaseWeapon.goldChance * 100).toFixed(0) }}%</span>
+                </div>
+                <div class="stat">
+                  <span class="stat-label">金錢範圍：</span>
+                  <span class="stat-value">{{ selectedBaseWeapon.goldMin }}-{{ selectedBaseWeapon.goldMax }}</span>
+                </div>
+                <div class="stat">
+                  <span class="stat-label">抽取機率：</span>
+                  <span class="stat-value">{{ getCardProbability(selectedBaseWeapon) }}%</span>
+                </div>
+              </div>
+              <div class="weapon-modal-actions">
+                <button class="btn-close-modal" @click="closeBaseWeaponModal">
+                  關閉
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </transition>
   </div>
 </template>
 
@@ -1852,6 +2841,7 @@ watch(chatMessages, () => {
 .game-header {
   text-align: center;
   margin-bottom: 20px;
+  position: relative;
 }
 
 .game-header h1 {
@@ -1859,6 +2849,41 @@ watch(chatMessages, () => {
   margin-bottom: 15px;
   text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.3);
   font-weight: bold;
+}
+
+.admin-panel {
+  margin-top: 15px;
+  display: flex;
+  justify-content: center;
+}
+
+.clear-all-data-btn {
+  padding: 10px 20px;
+  background: linear-gradient(135deg, #ff6b6b, #ee5a6f);
+  color: white;
+  border: none;
+  border-radius: 10px;
+  font-size: 0.95em;
+  font-weight: bold;
+  cursor: pointer;
+  transition: all 0.3s;
+  box-shadow: 0 4px 15px rgba(255, 107, 107, 0.4);
+}
+
+.clear-all-data-btn:hover:not(:disabled) {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 20px rgba(255, 107, 107, 0.6);
+  background: linear-gradient(135deg, #ff5252, #e53935);
+}
+
+.clear-all-data-btn:active:not(:disabled) {
+  transform: translateY(0);
+}
+
+.clear-all-data-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  transform: none;
 }
 
 .user-info {
@@ -2046,6 +3071,24 @@ watch(chatMessages, () => {
 .online-count {
   color: #4ecdc4;
   font-weight: bold;
+}
+
+.multiplayer-error {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.85em;
+  padding: 8px 12px;
+  margin-top: 8px;
+  border-radius: 8px;
+  background: rgba(244, 67, 54, 0.2);
+  border: 1px solid rgba(244, 67, 54, 0.5);
+  color: #ff5252;
+  backdrop-filter: blur(10px);
+}
+
+.multiplayer-error .error-icon {
+  font-size: 1.2em;
 }
 
 @keyframes pulse-dot {
@@ -3409,6 +4452,23 @@ watch(chatMessages, () => {
   animation: fadeIn 0.3s ease-in;
 }
 
+.clickable-card {
+  cursor: pointer;
+  transition: transform 0.2s, box-shadow 0.2s;
+  border-radius: 12px;
+  padding: 8px;
+  margin: -8px;
+}
+
+.clickable-card:hover {
+  transform: translateY(-2px);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.clickable-card:active {
+  transform: translateY(0);
+}
+
 @keyframes fadeIn {
   from {
     opacity: 0;
@@ -4173,7 +5233,25 @@ watch(chatMessages, () => {
   font-size: 1em;
   font-weight: bold;
   box-shadow: 0 2px 5px rgba(0, 0, 0, 0.3);
-  text-align: center;
+}
+
+.btn-close-modal {
+  flex: 1;
+  background: linear-gradient(135deg, #667eea, #764ba2);
+  color: white;
+  border: none;
+  padding: 12px 20px;
+  border-radius: 12px;
+  font-size: 1em;
+  font-weight: bold;
+  cursor: pointer;
+  transition: all 0.3s;
+  box-shadow: 0 4px 8px rgba(102, 126, 234, 0.4);
+  touch-action: manipulation;
+}
+
+.btn-close-modal:active {
+  transform: scale(0.95);
 }
 
 /* 彈窗動畫 */

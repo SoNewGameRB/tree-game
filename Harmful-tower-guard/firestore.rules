@@ -1,16 +1,3 @@
-# Firestore 安全規則設置
-
-為了讓多人遊戲功能正常運作，你需要在 Firebase Console 中設置 Firestore 安全規則。
-
-## 設置步驟
-
-1. 前往 [Firebase Console](https://console.firebase.google.com/)
-2. 選擇你的專案
-3. 進入「Firestore Database」
-4. 點擊「規則」標籤
-5. 將以下規則複製貼上：
-
-```javascript
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
@@ -56,7 +43,7 @@ service cloud.firestore {
     
     // 用戶資料 - 所有人可讀，用戶只能創建/更新自己的資料，管理員可以刪除
     // 注意：為了支持通過 usernameLower 登入的用戶更新原有用戶文檔，
-    // 我們允許已認證用戶更新任何用戶文檔（因為前端會驗證密碼）
+    // 我們允許已認證用戶更新任何用戶文檔（前端會驗證密碼和 usernameLower）
     match /users/{userId} {
       allow read: if true;
       allow create: if request.auth != null 
@@ -78,67 +65,4 @@ service cloud.firestore {
     }
   }
 }
-```
-
-6. 點擊「發布」保存規則
-
-## 規則說明
-
-- **gameState**: 所有玩家可以讀取遊戲狀態（樹血量等），但只有已登入的用戶可以更新
-- **attacks**: 所有玩家可以查看攻擊記錄，但只能創建自己的攻擊記錄
-- **onlineUsers**: 所有玩家可以查看在線用戶列表，但只能更新自己的狀態
-
-## 測試模式（開發階段）
-
-如果你還在開發階段，可以使用以下測試規則（**不建議用於生產環境**）：
-
-```javascript
-rules_version = '2';
-service cloud.firestore {
-  match /databases/{database}/documents {
-    match /{document=**} {
-      allow read, write: if true;
-    }
-  }
-}
-```
-
-⚠️ **警告**: 測試規則允許所有人讀寫所有數據，僅用於開發測試！
-
-## 索引設置
-
-為了優化查詢性能，建議創建以下索引：
-
-1. **attacks 集合**
-   - 欄位: `timestamp` (降序)
-   - 用途: 查詢最近的攻擊記錄
-
-2. **onlineUsers 集合**
-   - 欄位: `isOnline` (升序)
-   - 用途: 查詢在線用戶列表
-
-3. **users 集合**
-   - 欄位: `displayName` (升序)
-   - 用途: 查詢用戶名稱是否存在
-
-Firebase 會在首次查詢時提示你創建這些索引，點擊鏈接即可自動創建。
-
-## 用戶資料集合
-
-新增了 `users` 集合用於存儲用戶資料（名稱登入功能）：
-
-- **users/{userId}**: 存儲用戶的基本信息和遊戲數據
-- 所有玩家可以讀取（用於顯示在線玩家列表）
-- 用戶只能創建/更新自己的資料
-- **管理員可以刪除任何用戶資料**（通過檢查 `isAdmin` 字段）
-- 用戶也可以刪除自己的資料
-
-### 管理員權限
-
-系統會自動在用戶文檔中設置 `isAdmin` 字段來標記管理員：
-- 如果用戶的 email 在管理員列表中（定義於 `src/utils/admin.js`），創建/更新用戶時會自動設置 `isAdmin: true`
-- 管理員通過密碼登入時，如果輸入的名稱對應的用戶存在，也會被設置為管理員
-- 只有 `isAdmin: true` 的用戶才能刪除其他用戶的文檔
-
-詳細設置請參考 `NAME_LOGIN_SETUP.md` 文件。
 

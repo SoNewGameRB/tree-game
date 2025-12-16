@@ -14,7 +14,9 @@
     "check-deploy": "node scripts/checkDeploy.js",
     "deploy": "npm run check-deploy && npm run build && firebase deploy --only hosting",
     "deploy:preview": "npm run build && firebase hosting:channel:deploy preview",
-    "get-config": "node scripts/getFirebaseConfig.js"
+    "get-config": "node scripts/getFirebaseConfig.js",
+    "set-admin": "node scripts/setAdmin.js",
+    "check-rules": "node scripts/checkFirestoreRules.js"
   },
   "dependencies": {
     "firebase": "^12.6.0",
@@ -23,6 +25,7 @@
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "^6.0.2",
+    "terser": "^5.44.1",
     "vite": "^7.2.4",
     "vite-plugin-vue-devtools": "^8.0.5"
   }
